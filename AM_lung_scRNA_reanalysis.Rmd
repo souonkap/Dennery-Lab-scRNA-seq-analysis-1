@@ -1,0 +1,1548 @@
+---
+title: "R Notebook"
+authors: "Sorel V.Y. Ouonkap and Ella Ma"
+date: "01/15/2026"
+output: html_notebook
+---
+
+This check stores the complementary analysis of the data presented in the manuscript titled "Neonatal hyperoxia promotes macrophage senescence and lung injury via a p38MAPK-dependent secretome".
+
+Setup chunk:
+```{r}
+library(RColorBrewer)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+#library(hdf5r)
+library(stringr)
+library(BiocManager)
+#BiocManager::install('glmGamPoi')
+library(glmGamPoi)
+#BiocManager::install("biomaRt")
+library(biomaRt)
+library(data.table)
+library(viridis)
+library(dunn.test)
+#install.packages("R.utils")
+library(R.utils)
+```
+
+custom functions
+```{r}
+split.this = function(data, at = "", remove = ""){
+  x = unlist(strsplit(as.character(data), split = at, fixed = T))
+  if (is.null(remove)){return(x)}else{return(x[x != remove])}
+}
+
+d.frame = function(x, ncol = NULL, nrow = NULL, byrow = T, colnames = NULL){
+  if (!is.null(ncol)){x = data.frame(matrix(x, ncol = ncol, byrow = byrow))}
+  if (!is.null(nrow)){x = data.frame(matrix(x, nrow = nrow, byrow = byrow))}
+  if (!is.null(colnames)){colnames(x) = colnames}
+  return(x)
+}
+
+t.col <- function(color, percent = 50, name = NULL) {
+  rgb.val <- col2rgb(color)
+  t.col <- rgb(rgb.val[1], rgb.val[2], rgb.val[3],max = 255,alpha = (100 - percent) * 255 / 100,names = name)
+  invisible(t.col)
+}
+
+get.phenotype.p.values = function(df, within.var = T){
+  library(dunn.test)
+  #df = y[,g]
+  names(df) = c("g", "v")
+  g = as.vector(unique(df$g))
+  g = g[order(g)]
+  sp = ","
+  r = c(paste(g, collapse = sp), paste(g, collapse = sp), "anova test", 
+         summary(aov(v ~ g, data = df))[[1]]$`Pr(>F)`[1], 
+         paste(g, collapse = sp), paste(g, collapse = sp), "Kruskal-Wallis test", 
+         kruskal.test(v ~ g, data = df)$p.value)
+  for (i in 1:(length(g)-1)){#i=1
+    for (j in (i+1):length(g)){#j = i+1
+      p2 = c(g[i], g[j], "Mann-Whitney test", 
+             wilcox.test(v ~ g, data = df[df$g %in% c(g[i], g[j]),])$p.value)
+      p3 = c(g[i], g[j], "Welch Two Sample t-test", 
+             t.test(v ~ g, data = df[df$g %in% c(g[i], g[j]),])$p.value)
+      p = capture.output(dunn.test(x = df[df$g %in% c(g[i], g[j]),]$v, g = df[df$g %in% c(g[i], g[j]),]$g, kw = F)$P)
+      p = c(g[i], g[j], "Dunn test", as.numeric(as.character(split.this(p[length(p)], at = "[1] "))))
+      r = c(r, p,p2,p3)
+    }
+  }
+  r = data.frame(matrix(r, ncol = 4, byrow = T))
+  names(r) = c("group1", "group2","test", "p.value")
+  r$p.value = as.numeric(as.character(r$p.value))
+  return(r)
+}
+
+assign.stat.letters <- function(df, threshold = 0.01) {
+  
+  # --- 1. Input Validation ---
+  if (!is.data.frame(df) || ncol(df) != 3) {
+    stop("Input must be a data.frame with 3 columns: group1, group2, p.value.")
+  }
+  # Standardize column names for clarity
+  names(df) <- c("group1", "group2", "p.value")
+  if (!is.numeric(df$p.value)) {
+    stop("Column 3 (p.value) must be numeric.")
+  }
+  df$group1 <- as.character(df$group1)
+  df$group2 <- as.character(df$group2)
+  
+  # --- 2. Setup ---
+  # Get all unique group names and sort them for consistent ordering
+  all_groups <- sort(unique(c(df$group1, df$group2)))
+  n_groups <- length(all_groups)
+  
+  if (n_groups == 0) {
+    return(data.frame(groups = character(), letters = character()))
+  }
+  
+  # Create a matrix to store significance relationships (TRUE if significantly different)
+  is_significant <- matrix(FALSE, 
+                           nrow = n_groups, 
+                           ncol = n_groups,
+                           dimnames = list(all_groups, all_groups))
+  
+  # Populate the significance matrix based on the input p-values
+  for (i in 1:nrow(df)) {
+    if (df$p.value[i] < threshold) {
+      g1 <- df$group1[i]
+      g2 <- df$group2[i]
+      is_significant[g1, g2] <- TRUE
+      is_significant[g2, g1] <- TRUE
+    }
+  }
+  
+  # --- 3. Core Algorithm ---
+  # Initialize a list to hold the sets of letters for each group
+  assignments <- setNames(lapply(all_groups, function(x) character(0)), all_groups)
+  
+  # Define the pool of letters to be used
+  letter_pool <- letters
+  # Add more complex letter combinations if there are more than 26 groups
+  if (n_groups > 26) {
+    letter_pool <- c(letter_pool, paste0(rep(letters, each=26), letters))
+  }
+  letter_idx <- 0
+  
+  # Filter for only the non-significant pairs, as they drive letter sharing
+  nonsig_pairs <- df[df$p.value >= threshold, c("group1", "group2")]
+  
+  # Iterate over each non-significant pair
+  if (nrow(nonsig_pairs) > 0) {
+    for (i in 1:nrow(nonsig_pairs)) {
+      g1 <- nonsig_pairs$group1[i]
+      g2 <- nonsig_pairs$group2[i]
+      
+      # If the pair doesn't already share a letter, they need one
+      if (length(intersect(assignments[[g1]], assignments[[g2]])) == 0) {
+        
+        found_letter_to_reuse <- FALSE
+        # Attempt to reuse an existing letter first to minimize letter count
+        if (letter_idx > 0) {
+          for (l in letter_pool[1:letter_idx]) {
+            groups_with_l <- names(assignments)[sapply(assignments, function(x) l %in% x)]
+            
+            # Check if giving 'l' to g1 would violate any significance rules
+            g1_can_get_l <- all(!is_significant[g1, setdiff(groups_with_l, g1)])
+            
+            # Check if giving 'l' to g2 would violate any significance rules
+            g2_can_get_l <- all(!is_significant[g2, setdiff(groups_with_l, g2)])
+            
+            # If both can receive the letter 'l', assign it and stop searching
+            if (g1_can_get_l && g2_can_get_l) {
+              assignments[[g1]] <- c(assignments[[g1]], l)
+              assignments[[g2]] <- c(assignments[[g2]], l)
+              found_letter_to_reuse <- TRUE
+              break
+            }
+          }
+        }
+        
+        # If no existing letter could be reused, introduce a new one
+        if (!found_letter_to_reuse) {
+          letter_idx <- letter_idx + 1
+          if (letter_idx > length(letter_pool)) {
+            stop("Ran out of letters. The comparison structure is too complex.")
+          }
+          new_letter <- letter_pool[letter_idx]
+          assignments[[g1]] <- c(assignments[[g1]], new_letter)
+          assignments[[g2]] <- c(assignments[[g2]], new_letter)
+        }
+      }
+    }
+  }
+  
+  # --- 4. Finalization ---
+  # Some groups might not have any non-significant partners. They still need a letter.
+  # This loop ensures every group gets at least one letter.
+  for (g in all_groups) {
+    if (length(assignments[[g]]) == 0) {
+      letter_idx <- letter_idx + 1
+      if (letter_idx > length(letter_pool)) {
+        stop("Ran out of letters.")
+      }
+      new_letter <- letter_pool[letter_idx]
+      assignments[[g]] <- c(assignments[[g]], new_letter)
+    }
+  }
+  
+  # Convert the lists of letters into final, sorted character strings
+  final_strings <- sapply(assignments, function(x) paste(sort(unique(x)), collapse = ""))
+  
+  # Convert the named vector to a data.frame for the final output
+  result_df <- data.frame(
+    groups = names(final_strings),
+    letters = final_strings,
+    row.names = NULL # Reset row names for a clean output
+  )
+  
+  return(result_df)
+}
+
+draw.scatter.plot = function(df = NULL, add.mean = T, add.error = T, std.err = T, 
+                             add.median = F, main = "", ylab = "", x.axis = F, 
+                             y.axis = T, xlab = NULL, xlab.dist = 0.1, ylim = NULL, 
+                             xtra.y = 1.2, xlim = NULL, dist = 0.2, lwd = 2, 
+                             color = NULL, color.by = NULL, 
+                             pch = NULL, pch.by = NULL,     
+                             add.legend = T, mean.color = "black", 
+                             median.color = "gray30", seed = 0, add.labels = T, 
+                             order.groups = T, cap.values_at = NULL, 
+                             add.violin = F, trim.violin = T, violin.lwd = 2, 
+                             violin.dist = 0.4) {
+  
+  if (is.null(df)) return(message("No data frame provided."))
+  set.seed(seed)
+  df <- as.data.frame(df)
+  colnames(df)[1:2] <- c("group", "value")
+  df$value <- as.numeric(as.character(df$value))
+  df <- df[!is.na(df$value), ]
+  
+  if (!is.null(cap.values_at)) df$value[df$value > cap.values_at] = cap.values_at
+  groups <- if(order.groups) sort(unique(df$group)) else unique(df$group)
+  
+  # --- PCH & COLOR MAPPING LOGIC ---
+  sub_col_pch <- if (!is.null(pch.by)) pch.by else if (ncol(df) >= 3 && is.null(color.by)) colnames(df)[3] else NULL
+  if (!is.null(sub_col_pch)) {
+    df[[sub_col_pch]] <- as.factor(df[[sub_col_pch]])
+    levels_pch <- levels(df[[sub_col_pch]])
+    pch_map <- if (is.null(pch)) c(16, 17, 15, 18, 8, 11)[1:length(levels_pch)] else rep(pch, length.out = length(levels_pch))
+    df$pch_final <- pch_map[as.numeric(df[[sub_col_pch]])]
+  } else {
+    df$pch_final <- if (is.null(pch)) 19 else pch[1]
+  }
+  
+  if (!is.null(color.by)) {
+    df[[color.by]] <- as.factor(df[[color.by]])
+    levels_col <- levels(df[[color.by]])
+    color_map <- if (is.null(color) || length(color) < length(levels_col)) hcl.colors(length(levels_col), "Dark 3") else color
+    df$col_final <- color_map[as.numeric(df[[color.by]])]
+  } else {
+    if (is.null(color)) color <- hcl.colors(length(groups), "Set 2")
+    color_map_grp <- rep(color, length.out = length(groups))
+    df$col_final <- color_map_grp[match(df$group, groups)]
+  }
+  
+  # --- PLOT SETUP ---
+  if (is.null(ylim)) ylim <- c(min(0, min(df$value)), max(df$value) * xtra.y)
+  if (is.null(xlim)) xlim <- c(0.5, length(groups) + 0.5)
+  
+  plot(1, type="n", xlim=xlim, ylim=ylim, ylab=ylab, xlab="", main=main, 
+       xaxt=if(x.axis) "s" else "n", yaxt=if(y.axis) "s" else "n")
+  if (add.labels) axis(1, at=seq_along(groups), labels=groups)
+  
+  # --- DRAWING WITH SINA / DENSITY SPREAD LOGIC ---
+  for (i in seq_along(groups)) {
+    idx <- which(df$group == groups[i])
+    grp_vals <- df$value[idx]
+    if(length(grp_vals) == 0) next
+    
+    # 1. Calculate Density to determine the 'allowable' width for each point
+    # We use a slight adjustment to the bandwidth to keep the cloud smooth
+    dens <- density(grp_vals, bw = "nrd0")
+    
+    # 2. Map every point's Y-value to its corresponding Density (X-width)
+    # approx() interpolates the density at the exact Y-value of each data point
+    point_densities <- approx(dens$x, dens$y, xout = grp_vals)$y
+    
+    # Normalize densities so the widest part of the cloud matches 'dist'
+    max_d <- max(point_densities, na.rm = TRUE)
+    point_widths <- (point_densities / max_d) * dist
+    
+    # 3. Randomly spread points within that width (Uniform distribution)
+    # This ensures they are "mostly spread out" but stay within the density curve
+    x_jit <- i + runif(length(grp_vals), -point_widths, point_widths)
+    
+    # Points
+    points(x_jit, grp_vals, col = df$col_final[idx], 
+           pch = df$pch_final[idx], lwd = lwd)
+    
+    # Summary Stats
+    dx <- violin.dist / 2
+    if (add.mean) {
+      m <- mean(grp_vals); segments(i-dx, m, i+dx, m, col=mean.color, lwd=lwd+1)
+      if (add.error) {
+        se <- sd(grp_vals) / (if(std.err) sqrt(length(grp_vals)) else 1)
+        segments(i, m-se, i, m+se, col=mean.color, lwd=lwd)
+      }
+    }
+    if (add.median) segments(i-dx, median(grp_vals), i+dx, median(grp_vals), col=median.color, lwd=lwd+1)
+    
+    if (add.violin) {
+      if (trim.violin) {
+        k <- dens$x >= min(grp_vals) & dens$x <= max(grp_vals)
+        dens$x <- dens$x[k]; dens$y <- dens$y[k]
+      }
+      scaled_y <- (dens$y / max(dens$y)) * (violin.dist/2)
+      polygon(c(i-scaled_y, rev(i+scaled_y)), c(dens$x, rev(dens$x)), border="black", lwd=violin.lwd)
+    }
+  }
+  
+  # --- LEGENDS ---
+  if (add.legend) {
+    if (!is.null(color.by)) legend("topright", legend=levels(df[[color.by]]), col=color_map, pch=19, title=color.by, bty="n")
+    if (!is.null(sub_col_pch)) {
+      inset_val <- if(!is.null(color.by)) 0.15 else 0
+      legend("topright", legend=levels(df[[sub_col_pch]]), pch=pch_map, col="black", title=sub_col_pch, bty="n", inset=c(inset_val, 0))
+    }
+  }
+}
+
+reconcile.metric.scores <- function(seurat_obj, metric1_name, metric2_name, 
+                                    method = "pca_lm", percent_main_axis = 95, 
+                                    n_main_bins = 5, bin_method = "equal_width", 
+                                    classification_prefix = "Process"
+) {
+
+  # --- 1. Validation ---
+  if (!requireNamespace("Seurat", quietly = TRUE)) {
+    stop("Package 'Seurat' must be installed to use this function.")
+  }
+  if (!is(seurat_obj, "Seurat")) {
+    stop("Input 'seurat_obj' must be a Seurat object.")
+  }
+  if (!metric1_name %in% colnames(seurat_obj@meta.data)) {
+    stop(paste("Metric 1:", metric1_name, "not found in seurat_obj@meta.data"))
+  }
+  if (!metric2_name %in% colnames(seurat_obj@meta.data)) {
+    stop(paste("Metric 2:", metric2_name, "not found in seurat_obj@meta.data"))
+  }
+  if (!method %in% c("pca", "pca_lm", "lm")) {
+    stop("Method must be 'pca', 'pca_lm', or 'lm'.")
+  }
+  if (!bin_method %in% c("quantile", "equal_width")) {
+    stop("bin_method must be 'quantile' or 'equal_width'.")
+  }
+
+  # --- 2. Prepare Data ---
+  # Get all metadata
+  all_metadata <- seurat_obj@meta.data
+
+  # Create a data frame to store new metadata, initialized with NAs
+  # This ensures all cells are present in the final output
+  new_metadata <- data.frame(
+    main_axis_score = rep(NA_real_, nrow(all_metadata)),
+    off_axis_score = rep(NA_real_, nrow(all_metadata)),
+    classification = rep(NA_character_, nrow(all_metadata)),
+    row.names = rownames(all_metadata)
+  )
+
+  # Identify cells that have valid, non-NA scores for both metrics
+  valid_cells_idx <- complete.cases(all_metadata[, c(metric1_name, metric2_name)])
+  if (sum(valid_cells_idx) == 0) {
+    warning("No cells with complete data for both metrics. Returning object with NA columns.")
+    return(seurat_obj)
+  }
+  
+  # Create a temporary data.frame for processing only valid cells
+  data_to_process <- all_metadata[valid_cells_idx, c(metric1_name, metric2_name)]
+
+  # --- 3. Calculate Main and Off-Axis Scores ---
+
+  if (method %in% c("pca", "pca_lm")) {
+    message("Running PCA...")
+    pca_res <- prcomp(
+      ~ data_to_process[[metric1_name]] + data_to_process[[metric2_name]],
+      data = data_to_process,
+      scale. = TRUE,
+      center = TRUE
+    )
+
+    # CRITICAL: Ensure PC1 is the positive diagonal.
+    if (sum(pca_res$rotation[, "PC1"]) < 0) {
+      message("Flipping PC signs to ensure PC1 represents the positive diagonal.")
+      pca_res$x <- -pca_res$x
+      pca_res$rotation <- -pca_res$rotation
+    }
+
+    if (method == "pca") {
+      message("Using raw PCA scores.")
+      data_to_process$main_axis_score <- pca_res$x[, "PC1"]
+      data_to_process$off_axis_score <- pca_res$x[, "PC2"]
+      
+    } else {
+      message("Using PCA + Linear Model (pca_lm) adjustment.")
+      # Fit line to the PC scores to account for any visual drift
+      pc_scores <- data.frame(PC1 = pca_res$x[, "PC1"], PC2 = pca_res$x[, "PC2"])
+      pca_lm_model <- lm(PC2 ~ PC1, data = pc_scores)
+      
+      data_to_process$off_axis_score <- residuals(pca_lm_model)
+      # We use PC1 as the Main Axis (projecting onto the line)
+      data_to_process$main_axis_score <- pc_scores$PC1
+    }
+
+  } else if (method == "lm") {
+    message("Using Linear Model (lm) on raw metrics...")
+    model <- lm(as.formula(paste(metric2_name, "~", metric1_name)), data = data_to_process)
+
+    # Calculate raw fitted values (projection onto the line)
+    raw_fitted <- fitted(model)
+    
+    # --- Peak-Centered Z-Score Calculation ---
+    # 1. Estimate density to find the mode (peak) of the data distribution along the line
+    dens <- density(raw_fitted, na.rm = TRUE)
+    peak_val <- dens$x[which.max(dens$y)]
+    
+    # 2. Calculate Standard Deviation
+    fitted_sd <- sd(raw_fitted, na.rm = TRUE)
+    
+    # 3. Calculate Modified Z-score: (Score - Peak) / SD
+    # Result: 0 is the most common state, +1 is 1 SD above the peak, etc.
+    data_to_process$main_axis_score <- (raw_fitted - peak_val) / fitted_sd
+    
+    # Off-axis score = the residual (distance from the line)
+    data_to_process$off_axis_score <- residuals(model)
+  }
+
+  # --- 4. Identify and Classify Outliers ---
+  message(paste0("Identifying outliers (", 100 - percent_main_axis, "% of cells)..."))
+
+  lower_bound <- (1 - (percent_main_axis / 100)) / 2
+  upper_bound <- 1 - lower_bound
+
+  lower_thresh <- quantile(data_to_process$off_axis_score, probs = lower_bound, na.rm = TRUE)
+  upper_thresh <- quantile(data_to_process$off_axis_score, probs = upper_bound, na.rm = TRUE)
+
+  data_to_process$classification <- "MainAxis"
+  data_to_process$classification[data_to_process$off_axis_score > upper_thresh] <- "Outlier_Above_Trend"
+  data_to_process$classification[data_to_process$off_axis_score < lower_thresh] <- "Outlier_Below_Trend"
+
+  # --- 5. Bin Main Axis Cells ---
+  message(paste0("Binning main axis cells (", percent_main_axis, "%) into ", n_main_bins, " bins..."))
+
+  main_axis_cells_idx <- which(data_to_process$classification == "MainAxis")
+  
+  if (length(main_axis_cells_idx) > 0) {
+    scores_to_bin <- data_to_process$main_axis_score[main_axis_cells_idx]
+    bin_labels <- paste0("MainAxis_Bin_", 1:n_main_bins)
+
+    if (bin_method == "quantile") {
+      breaks <- unique(quantile(scores_to_bin, probs = seq(0, 1, by = 1 / n_main_bins), na.rm = TRUE))
+      if (length(breaks) < 2) {
+        warning("Cannot create quantile bins; too few unique data points. All main axis cells binned as 'MainAxis_Bin_1'.")
+        binned_data <- "MainAxis_Bin_1"
+      } else {
+        dynamic_labels <- paste0("MainAxis_Bin_", 1:(length(breaks) - 1))
+        binned_data <- cut(scores_to_bin, breaks = breaks, labels = dynamic_labels, include.lowest = TRUE)
+      }
+    } else if (bin_method == "equal_width") {
+      binned_data <- cut(scores_to_bin, breaks = n_main_bins, labels = bin_labels, include.lowest = TRUE)
+    }
+    data_to_process$classification[main_axis_cells_idx] <- as.character(binned_data)
+  }
+
+  # --- 6. Add to Seurat Object ---
+  message("Adding new metadata to Seurat object...")
+  
+  new_metadata[valid_cells_idx, "main_axis_score"] <- data_to_process$main_axis_score
+  new_metadata[valid_cells_idx, "off_axis_score"] <- data_to_process$off_axis_score
+  new_metadata[valid_cells_idx, "classification"] <- data_to_process$classification
+
+  col_names <- paste(classification_prefix, c("Adjusted_Score", "Off_Axis_Score", "Classification"), sep = "_")
+  colnames(new_metadata) <- col_names
+  
+  seurat_obj <- AddMetaData(seurat_obj, metadata = new_metadata)
+  
+  message("Done.")
+  return(seurat_obj)
+}
+```
+
+#loading dataset GSE151974. the raw files are available in the GSE database
+```{r}
+counts_file <- "GSE151974_raw_umi_matrix_postfilter.csv.gz"
+meta_file   <- "GSE151974_cell_metadata_postfilter.csv.gz"
+
+counts_data <- fread(counts_file, data.table = FALSE)
+rownames(counts_data) <- counts_data[, 1]
+counts_data <- counts_data[, -1] 
+
+cell_meta <- read.csv(meta_file, row.names = 1)
+
+cook_all_data <- CreateSeuratObject(counts = counts_data, 
+                                 project = "GSE151974", 
+                                 meta.data = cell_meta)
+
+# 6. Verify your object
+print(cook_all_data)
+
+table(cook_all_data@meta.data$orig.ident, cook_all_data@meta.data$Oxygen)
+table(cook_all_data@meta.data$orig.ident, cook_all_data@meta.data$Age)
+```
+
+QC and filtering step:
+```{r}
+# Your seurat_obj must be the one with the raw counts
+# We'll store the mitochondrial percentage in the object's metadata
+cook_all_data[["percent.mt"]] <- PercentageFeatureSet(cook_all_data, pattern = "^mt-")
+
+VlnPlot(cook_all_data, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+cook_data_cln <- subset((cook_all_data), 
+                               subset = nFeature_RNA > 700 & nFeature_RNA < 8000 & percent.mt < 5)
+
+VlnPlot(cook_data_cln, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+Doing SCT transform:
+- split by orig.ident into layers and analyze separately before using integrate layers
+- used 50 PC's
+```{r}
+# Split
+cook_data_cln[["RNA"]] <- split(cook_data_cln[["RNA"]], f = cook_data_cln$orig.ident)
+
+cook_data_cln <- SCTransform(cook_data_cln, vars.to.regress = "percent.mt", verbose = TRUE, return.only.var.genes = FALSE)
+
+cook_data_cln <- RunPCA(cook_data_cln)
+
+ElbowPlot(cook_data_cln, ndims = 50)
+
+DefaultAssay(cook_data_cln) <- "SCT"
+
+DimHeatmap(cook_data_cln, dims = 30:50, cells = 500, balanced = TRUE)
+```
+
+Integrating the layers again:
+- using harmony
+- finding neighbors with 50 PC's
+- finding clusters with resolution 2.0
+- Running a UMAP and plotting using DimPlot
+```{r}
+cook_data_cln <- IntegrateLayers(
+  object = cook_data_cln, method = HarmonyIntegration,
+  orig.reduction = "pca", new.reduction = "harmony", normalization.method = "SCT",
+  verbose = FALSE
+)
+
+cook_data_cln <- FindNeighbors(cook_data_cln, reduction = "harmony", dims = 1:50)
+cook_data_cln <- FindClusters(cook_data_cln, resolution = 2.0, cluster.name = "harmony_clusters")
+
+cook_data_cln <- RunUMAP(cook_data_cln, reduction = "harmony", dims = 1:50, reduction.name = "umap.harmony")
+
+#UMAP Plot with no splitting (all data)
+DimPlot(
+  cook_data_cln,
+  reduction = "umap.harmony",
+  group.by = "harmony_clusters",
+  combine = FALSE, label.size = 2
+)
+
+```
+
+Rejoin layers and perform other analysis:
+```{r}
+cook_data_cln <- JoinLayers(cook_data_cln, assay ='RNA')
+
+Idents(cook_data_cln) <- "orig.ident"
+cook_data_cln <- PrepSCTFindMarkers(cook_data_cln)
+DefaultAssay(cook_data_cln) <- "SCT"
+
+#Comparing each cluster against all other clusters
+Idents(cook_data_cln) <- "harmony_clusters"
+cluster_markers <- FindAllMarkers((cook_data_cln), only.pos = TRUE) 
+```
+
+Adding a metadata column so it is easier to read and interpret the names of the data 
+```{r}
+# 1. Create the new column by pasting 'Age', 'Oxygen', and 'orig.ident'
+cook_data_cln$age_oxygen_orig_ident <- paste(cook_data_cln$Age, 
+                                             cook_data_cln$Oxygen, 
+                                             cook_data_cln$orig.ident, 
+                                             sep = "_")
+# 2. Check the results
+# This will show you the first few new labels
+print(head(cook_data_cln$age_oxygen_orig_ident))
+
+# You can also see all the unique combinations
+print(unique(cook_data_cln$age_oxygen_orig_ident))
+
+cook_data_cln$pnd_condition <- paste(cook_data_cln$Age, 
+                                             cook_data_cln$Oxygen,
+                                             sep = "_")
+
+print(unique(cook_data_cln$pnd_condition))
+
+pnd_levels <- c("P3_Normoxia", "P3_Hyperoxia", 
+               "P7_Normoxia", "P7_Hyperoxia", 
+               "P14_Normoxia", "P14_Hyperoxia")
+
+cook_data_cln$pnd_condition <- factor(cook_data_cln$pnd_condition, 
+                                   levels = pnd_levels)
+```
+
+Lung Azimuth Anchors
+######################################
+Needs work
+######################################
+```{r}
+azimuth_lung_ann = readRDS("lungmap.rds")
+
+DefaultAssay(cook_data_cln) <- "SCT"
+azimuth_anchors <- FindTransferAnchors(
+  reference = azimuth_lung_ann,
+  query = cook_data_cln,
+  normalization.method = "SCT",
+  k.filter = NA,
+  reference.reduction = "pca", # Name of the PCA in the reference
+  dims = 1:50       # how many PC's used in the object
+)
+
+cook_data_cln <- MapQuery(
+  anchorset = azimuth_anchors,
+  query = cook_data_cln,
+  reference = azimuth_lung_ann,
+  refdata = list(
+    lineage_l1 = "lineage_level1",
+    lineage_l2 = "lineage_level2",
+    cell_type = "CellType",
+    cell_type_l3 = "celltype_level3",
+    cell_type_l3_full = "celltype_level3_fullname"
+  ),
+  reference.reduction = "pca"#, 
+  #reduction.model = "umap"
+)
+
+
+DimPlot(cook_data_cln,
+        reduction = "umap.harmony",
+        group.by = "predicted.cell_type_l3",
+        split.by = "age_oxygen_orig_ident", combine = FALSE)
+
+DimPlot(
+  cook_data_cln,
+  reduction = "umap.harmony",
+  group.by = "predicted.cell_type_l3",
+  combine = FALSE, label.size = 4, label = TRUE)
+
+DimPlot(
+  cook_data_cln,
+  reduction = "umap.harmony",
+  group.by = "CellType",
+  combine = FALSE, label.size = 4, label = TRUE)
+```
+
+Plotting cell types over time:
+```{r}
+# 1. Metadata from your Seurat object
+metdat_cook <- cook_data_cln@meta.data
+
+# percentage of each cell type within each sample
+metdat_cook <- metdat_cook%>%
+  group_by(pnd_condition, predicted.cell_type_l3) %>%
+  summarise(count = n()) %>%
+  group_by(pnd_condition) %>%
+  mutate(percent = (count / sum(count)) * 100)
+
+#all cell type proportional distr. accross treatments and timepoints
+ggplot(metdat_cook, aes(x = pnd_condition, y = percent, fill = predicted.cell_type_l3)) +
+  geom_col(color= "black") + # geom_col() is a shortcut for geom_bar(stat="identity")
+  theme_classic() +
+  labs(
+    title = "Cellular Composition by Condition",
+    x = "Sample",
+    y = "Percentage of Cells (%)",
+    fill = "Cell Type"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#bar plot showing changes over time
+barplot(metdat_cook, names.arg="predicted.cell_type_l3")
+```
+
+
+markers of senescence and apoptosis
+```{r}
+markers = list(SenMayo = c("Acvr1b", "Ang", "Angpt1", "Angptl4", "Areg", "Axl", "Bex3", "Bmp2", "Bmp6", "C3", "Ccl1", "Ccl2", "Ccl20", "Ccl24", "Ccl26", "Ccl3", "Ccl4", "Ccl5", "Ccl7", "Ccl8", "Cd55", "Cd9", "Csf1", "Csf2", "Csf2rb", "Cst10", "Ctnnb1", "Ctsb", "Cxcl1", "Cxcl10", "Cxcl12", "Cxcl16", "Cxcl2", "Cxcl3", "Cxcr2", "Dkk1", "Edn1", "Egf", "Egfr", "Ereg", "Esm1", "Ets2", "Fas", "Fgf1", "Fgf2", "Fgf7", "Gdf15", "Gem", "Gmfg", "Hgf", "Hmgb1", "Icam1", "Icam5", "Igf1", "Igfbp1", "Igfbp2", "Igfbp3", "Igfbp4", "Igfbp5", "Igfbp6", "Igfbp7", "Il10", "Il13", "Il15", "Il18", "Il1a", "Il1b", "Il2", "Il6", "Il6st", "Il7", "Inha", "Iqgap2", "Itga2", "Itpka", "Jun", "Kitl", "Lcp1", "Mif", "Mmp13", "Mmp10","Mmp12", "Mmp13", "Mmp14", "Mmp2", "Mmp3", "Mmp9", "Nap1l4", "Nrg1", "Pappa", "Pecam1", "Pgf", "Pigf", "Plat", "Plau", "Plaur", "Ptbp1", "Ptger2", "Ptges", "Rps6ka5", "Scamp4", "Selplg", "Sema3f", "Serpinb3a", "Serpine1", "Serpine2", "Spp1", "Spx", "Timp2", "Tnf", "Tnfrsf11b", "Tnfrsf1a", "Tnfrsf1b", "Tubgcp2", "Vegfa", "Vegfc", "Vgf", "Wnt16", "Wnt2"), 
+               SenVoys = c("Cdkn1a", "Cdkn2a", "Cdkn2b", "Cdkn1b", "Cebpb", "Il6", "Il1a", "Cxcl1", "Ccl2", "Mmp3", "Serpine1", "Gdf15", "Mdm2", "Glb1", "Igfbp7", "Igfbp3", "Ets1", "Fos", "Mmp9", "Ets2", "Bcl6", "Zfp36", "Sgk1", "Hmga1", "Hp1bp3", "Ctsk", "Lamp1", "Fasn", "Bhlhe40", "Col4a1", "Col25a1", "Fbn2", "Lama4", "Vcan", "Mmp10", "Loxl1", "Timp3", "Gpc5", "Cx3cl1", "Ceacam1", "Dact3", "Dnah8", "Fhod3", "Kcnma1", "Mamdc2", "Selp", "Spata18", "Tp53inp1", "Tp53tg1", "Zmat3", "Cd200", "Tgfb1", "Ctgf", "Thbs1", "B2m", "Dpp4", "Gpnmb", "Atf3", "Mx1", "Cd36", "Ctsd", "Bcl2l1", "Slc9a3r1", "Stk39", "Anxa1", "Anxa2", "Vim", "Irf1", "Relb", "Cdkn1c", "Cdkn2d", "Ctss", "Lgals3", "Rab13", "Clu", "Pld3", "Vps26a", "Mapkapk2", "Stat1"),
+               apoptosis = c("Bbc3", "Pmaip1", "Bid", "Bax", "Bak1", "Casp3", "Casp7", "Casp9", "Casp8", "Apaf1", "Fadd", "Gzmb", "Aifm1", "Tp53i3", "Perp", "Dffa", "Gadd45a", "Bnip3l", "Bcl2l11", "Hrk", "Ei24", "Cycs", "Diablo", "Htra2", "Endog", "Trp63", "Trp73", "Xaf1", "Casp2", "Casp6", "Aen", "Dram1", "Trp53i11", "Pycard", "Card10", "Bcl2l13", "Bok", "Ripk1", "Dapk1", "Phlda3", "Siva1"))
+```
+
+Scoring Senescence and apoptosis
+```{r}
+cook_data_cln@active.assay = "SCT"
+cook_data_cln = AddModuleScore(cook_data_cln, markers, assay = "SCT", slot = "data")
+
+cook_data_cln = reconcile.metric.scores(cook_data_cln, "Cluster2", "Cluster1", method = "pca", 
+                                         classification_prefix = "Sen", percent_main_axis = 100)
+```
+
+making some plot
+```{r}
+cook_data_cln@meta.data$pnd = "P14"
+cook_data_cln@meta.data$pnd[cook_data_cln@meta.data$Age == "P3"] = "P03"
+cook_data_cln@meta.data$pnd[cook_data_cln@meta.data$Age == "P7"] = "P07"
+cook_data_cln@meta.data$cond = "Air"
+cook_data_cln@meta.data$cond[cook_data_cln@meta.data$Oxygen == "Hyperoxia"] = "O2"
+cook_data_cln@meta.data$sample = paste(cook_data_cln@meta.data$pnd, cook_data_cln@meta.data$cond)
+
+
+y = FetchData(cook_data_cln, vars = c("sample","Sen_Adjusted_Score", "Cluster1", "Cluster2", "Cdkn1a", "Cluster3", "Mcl1", "Bcl2l1", "Hmox1", "Cyba", "Ftl1", "Fth1", "Slc40a1"))
+
+main = "All Cells"
+color =c("skyblue", "magenta")
+p.val = 0.01
+
+#Adjusted senescence score per sample for all cells
+g = c("sample", "Sen_Adjusted_Score")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "Sen_Adjusted_Score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#SenMayo senescence score per sample for all cells
+g = c("sample", "Cluster1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "SenMayo geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#SenVoys senescence score per sample for all cells
+g = c("sample", "Cluster2")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "SenVoys geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#Apoptosis score per sample for all cells
+g = c("sample", "Cluster3")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "Apoptosis geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#p21 gene expression per sample for all cells
+g = c("sample", "Cdkn1a")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "p21 gene expression")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#corelation between SenMayo and SenVoys
+x.a = "Cluster2"#SenVoys
+y.a = "Cluster1"#SenMayo
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "SenVoys", ylab = "SenMayo")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis and senescence
+x.a = "Sen_Adjusted_Score"#Adjusted senescence score
+y.a = "Cluster3"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Apoptosis Score")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis blocker Mcl1 and senescence
+x.a = "Sen_Adjusted_Score"#Ajusted senescence score
+y.a = "Mcl1"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Mcl1")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis blocker and senescence
+x.a = "Sen_Adjusted_Score"#Ajusted senescence score
+y.a = "Bcl2l1"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+#plot(x$Cluster2, x$Cluster1, pch = 19)
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Bcl2l1")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#iron sequestration gene expression per sample for all cells
+
+g = c("sample", "Hmox1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Cyba")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Ftl1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Fth1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Slc40a1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+```
+
+let's remake the sample plots but for alveolar macrophages only
+```{r}
+y = subset(cook_data_cln, subset = predicted.cell_type_l3 %in% c("AM"))
+y = FetchData(y, vars = c("sample","Sen_Adjusted_Score", "Cluster1", "Cluster2", "Cdkn1a", "Cluster3", "Mcl1", "Bcl2l1", "Hmox1", "Cyba", "Ftl1", "Fth1", "Slc40a1"))
+gc()
+
+main = "Alveolar Macrophage"
+color =c("skyblue", "magenta")
+p.val = 0.01
+#Adjusted senescence score per sample for AM
+g = c("sample", "Sen_Adjusted_Score")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "Sen_Adjusted_Score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#SenMayo senescence score per sample for AM
+g = c("sample", "Cluster1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "SenMayo geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#SenVoys senescence score per sample for AM
+g = c("sample", "Cluster2")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "SenVoys geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#Apoptosis score per sample for AM
+g = c("sample", "Cluster3")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "Apoptosis geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#p21 gene expression per sample for AM
+g = c("sample", "Cdkn1a")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "p21 gene expression")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#corelation between SenMayo and SenVoys
+x.a = "Cluster2"#SenVoys
+y.a = "Cluster1"#SenMayo
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "SenVoys", ylab = "SenMayo")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis and senescence
+x.a = "Sen_Adjusted_Score"#Adjusted senescence score
+y.a = "Cluster3"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Apoptosis Score")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis blocker Mcl1 and senescence
+x.a = "Sen_Adjusted_Score"#Ajusted senescence score
+y.a = "Mcl1"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Mcl1")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis blocker and senescence
+x.a = "Sen_Adjusted_Score"#Ajusted senescence score
+y.a = "Bcl2l1"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Bcl2l1")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#iron sequestration gene expression per sample for AM
+
+g = c("sample", "Hmox1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Cyba")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Ftl1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Fth1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Slc40a1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+```
+
+#Next, let's score senescence and apoptosis in our dataset and generate the same plots
+
+```{r}
+load("all_data.combined.RData")
+all_data.combined@active.assay = "SCT"
+all_data.combined = AddModuleScore(all_data.combined, markers, assay = "SCT", slot = "data")
+
+all_data.combined = reconcile.metric.scores(all_data.combined, "Cluster2", "Cluster1", 
+                                            method = "pca", classification_prefix = "Sen",
+                                            percent_main_axis = 100)
+all_data.combined@meta.data$sample = all_data.combined@meta.data$orig.ident
+```
+
+```{r}
+
+y = FetchData(all_data.combined, vars = c("sample","Sen_Adjusted_Score", "Cluster1", "Cluster2", "Cdkn1a", "Cluster3", "Mcl1", "Bcl2l1", "Hmox1", "Cyba", "Ftl1", "Fth1", "Slc40a1"))
+
+main = "All Cells"
+color =c("skyblue", "magenta", "darkgreen")
+p.val = 0.01
+
+#Adjusted senescence score per sample for all cells
+g = c("sample", "Sen_Adjusted_Score")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "Sen_Adjusted_Score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#SenMayo senescence score per sample for all cells
+g = c("sample", "Cluster1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "SenMayo geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#SenVoys senescence score per sample for all cells
+g = c("sample", "Cluster2")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "SenVoys geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#Apoptosis score per sample for all cells
+g = c("sample", "Cluster3")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "Apoptosis geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#p21 gene expression per sample for all cells
+g = c("sample", "Cdkn1a")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "p21 gene expression")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#corelation between SenMayo and SenVoys
+x.a = "Cluster2"#SenVoys
+y.a = "Cluster1"#SenMayo
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "SenVoys", ylab = "SenMayo")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis and senescence
+x.a = "Sen_Adjusted_Score"#Adjusted senescence score
+y.a = "Cluster3"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Apoptosis Score")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis blocker Mcl1 and senescence
+x.a = "Sen_Adjusted_Score"#Ajusted senescence score
+y.a = "Mcl1"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Mcl1")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis blocker and senescence
+x.a = "Sen_Adjusted_Score"#Ajusted senescence score
+y.a = "Bcl2l1"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+#plot(x$Cluster2, x$Cluster1, pch = 19)
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Bcl2l1")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#iron sequestration gene expression per sample for all cells
+
+g = c("sample", "Hmox1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Cyba")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Ftl1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Fth1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Slc40a1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+```
+
+let's remake the sample plots but for alveolar macrophages only
+```{r}
+y = subset(all_data.combined, subset = predicted.id %in% c("Alveolar macrophage_Ear2 high(Lung)", "Alveolar macrophage_Pclaf high(Lung)"))
+y = FetchData(y, vars = c("sample","Sen_Adjusted_Score", "Cluster1", "Cluster2", "Cdkn1a", "Cluster3", "Mcl1", "Bcl2l1", "Hmox1", "Cyba", "Ftl1", "Fth1", "Slc40a1"))
+gc()
+
+main = "Alveolar Macrophage"
+color =c("skyblue", "magenta")
+p.val = 0.01
+#Adjusted senescence score per sample for AM
+g = c("sample", "Sen_Adjusted_Score")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "Sen_Adjusted_Score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#SenMayo senescence score per sample for AM
+g = c("sample", "Cluster1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "SenMayo geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#SenVoys senescence score per sample for AM
+g = c("sample", "Cluster2")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "SenVoys geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#Apoptosis score per sample for AM
+g = c("sample", "Cluster3")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "Apoptosis geneset score")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#p21 gene expression per sample for AM
+g = c("sample", "Cdkn1a")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = "p21 gene expression")
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+#corelation between SenMayo and SenVoys
+x.a = "Cluster2"#SenVoys
+y.a = "Cluster1"#SenMayo
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "SenVoys", ylab = "SenMayo")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis and senescence
+x.a = "Sen_Adjusted_Score"#Adjusted senescence score
+y.a = "Cluster3"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Apoptosis Score")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis blocker Mcl1 and senescence
+x.a = "Sen_Adjusted_Score"#Ajusted senescence score
+y.a = "Mcl1"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Mcl1")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#corelation between apoptosis blocker and senescence
+x.a = "Sen_Adjusted_Score"#Ajusted senescence score
+y.a = "Bcl2l1"#Apoptosis
+
+yy = lm(y[,y.a] ~ y[,x.a], y)
+m = yy$coefficients[2]
+b = yy$coefficients[1]
+z = summary(yy)
+fit = m*y[,x.a] + b
+cf = round(cor(y[,y.a], y[,x.a]),4)
+
+plot(y[,x.a], y[,y.a], col =t.col("black", percent = 30)  , pch = 17, 
+     main = paste(main, ": corel. plot, r = ", cf), xlab = "Adjusted Senescence Score", 
+     ylab = "Bcl2l1")#
+abline(v=0, lty = 2)
+abline(h=0, lty = 2)
+lines(y[,x.a], fit, col = "red", lwd = 3)
+
+#iron sequestration gene expression per sample for AM
+
+g = c("sample", "Hmox1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Cyba")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Ftl1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Fth1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+
+g = c("sample", "Slc40a1")
+draw.scatter.plot(y[,g], lwd = 4, median.color = "black", 
+                  color = color, add.median = F, add.mean = T, add.error = T,  
+                  std.err = T, add.violin = T, violin.lwd  = 3, xlim = c(0,10), 
+                  main = main, ylab = paste(g[2], "gene expression"))
+
+p = get.phenotype.p.values(y[,g])
+p = p[p$test == "Mann-Whitney test",]
+p$test = NULL
+p$p.value = p.adjust(p$p.value, method = "bonferroni")
+p = assign.stat.letters(p, threshold = p.val)
+```
+
+```{r}
+sessionInfo()
+```
+
